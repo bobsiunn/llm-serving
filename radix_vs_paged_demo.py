@@ -2,6 +2,7 @@
 RadixAttention (SGLang) vs PagedAttention (vLLM) 비교
 
 두 가지 시나리오로 각각이 유리한 상황을 실측한다.
+block_size는 두 시나리오 공통으로 8을 사용한다.
 
 시나리오 A — RadixAttention 유리
   공유 system prompt를 가진 요청들이 들어올 때.
@@ -25,10 +26,9 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 
 MODEL = "gpt2"
 N_ANSWER_TOKENS = 5
+BLOCK_SIZE = 8   # 두 시나리오 공통
 
 # ── 시나리오 A 파라미터 ────────────────────────────────────────
-A_BLOCK_SIZE = 16    # vLLM 기본값
-
 A_SYSTEM_PROMPT = (
     "You are a helpful AI assistant. "
     "Answer questions clearly and concisely. "
@@ -42,14 +42,12 @@ A_REQUESTS = [
 ]
 
 # ── 시나리오 B 파라미터 ────────────────────────────────────────
-B_BLOCK_SIZE    = 8   # 각 요청이 1 full block + partial 구조가 되도록
-B_BUDGET_BLOCKS = 2   # 메모리 budget: block 수
-B_BUDGET_TOKENS = B_BUDGET_BLOCKS * B_BLOCK_SIZE
+B_BUDGET_BLOCKS = 2
+B_BUDGET_TOKENS = B_BUDGET_BLOCKS * BLOCK_SIZE   # = 16
 
-# 완전히 다른 prefix (공유 없음), 각 9~11 토큰
+# 공유 prefix 없음, 각 8~9 토큰 (1 full block + partial)
+# budget=16tok: RadixAttention은 1개 시퀀스만 보존, PagedAttention은 2개 block 보존
 B_REQUESTS = [
-    "Quantum mechanics is the foundation of modern physics research",
-    "Renaissance paintings brought realism and perspective into art",
     "Machine learning algorithms learn patterns from labeled datasets",
     "Environmental scientists study the effects of climate on life",
 ]
@@ -195,6 +193,7 @@ class RadixTreeLRU(RadixTree):
         super().__init__()
         self.max_tokens = max_tokens
         self._cached_tokens = 0
+        self.eviction_log: list[list[int]] = []
 
     def _kv_leaves(self, node=None):
         if node is None:
@@ -215,17 +214,42 @@ class RadixTreeLRU(RadixTree):
             return 0
         node, parent, key = min(leaves, key=lambda x: x[0].last_access)
         freed = len(node.token_ids)
+        self.eviction_log.append(list(node.token_ids))
         node.kv_cache = None
         del parent.children[key]
         self._cached_tokens -= freed
         return freed
 
     def insert(self, token_ids: list[int], kv_cache):
-        while self._cached_tokens + len(token_ids) > self.max_tokens:
+        # 이미 트리에 있는 경로는 새 토큰으로 세지 않음
+        node, pos, n_new = self.root, 0, 0
+        while pos < len(token_ids):
+            tok = token_ids[pos]
+            if tok not in node.children:
+                n_new += len(token_ids) - pos
+                break
+            child = node.children[tok]
+            common = 0
+            for ct in child.token_ids:
+                if pos + common >= len(token_ids) or token_ids[pos + common] != ct:
+                    break
+                common += 1
+            if common < len(child.token_ids):
+                n_new += len(token_ids) - (pos + common)
+                break
+            pos += common
+            node = child
+
+        while self._cached_tokens + n_new > self.max_tokens:
             if self._evict_lru() == 0:
                 break
         super().insert(token_ids, kv_cache)
-        self._cached_tokens += len(token_ids)
+        self._cached_tokens += n_new
+
+    def pop_evictions(self) -> list[list[int]]:
+        log = self.eviction_log[:]
+        self.eviction_log.clear()
+        return log
 
 
 # ════════════════════════════════════════════════════════════════
@@ -298,18 +322,32 @@ class PagedAttentionCacheLRU(PagedAttentionCache):
     def __init__(self, block_size: int, max_blocks: int):
         super().__init__(block_size)
         self.max_blocks = max_blocks
+        self.eviction_log: list[list[int]] = []
 
     def _evict_lru(self):
         if not self.block_table:
             return
         oldest = min(self.block_table.values(), key=lambda b: b.last_access)
+        self.eviction_log.append(list(oldest.token_ids))
         del self.block_table[oldest.block_hash]
 
     def insert(self, token_ids: list[int], full_kv):
-        n_new = len(token_ids) // self.block_size
+        # 이미 캐시에 있는 block은 새 block으로 세지 않음
+        prev, pos, n_new = "", 0, 0
+        while pos + self.block_size <= len(token_ids):
+            bh = self._hash(token_ids[pos:pos + self.block_size], prev)
+            if bh not in self.block_table:
+                n_new += 1
+            prev = bh
+            pos += self.block_size
         while len(self.block_table) + n_new > self.max_blocks:
             self._evict_lru()
         super().insert(token_ids, full_kv)
+
+    def pop_evictions(self) -> list[list[int]]:
+        log = self.eviction_log[:]
+        self.eviction_log.clear()
+        return log
 
 
 # ════════════════════════════════════════════════════════════════
@@ -333,18 +371,18 @@ a_full_ids = [sys_ids + tokenizer.encode(q, add_special_tokens=False)
 shared_prefix_len = len(sys_ids) + 4   # "Question: What is" 포함
 
 print("\n" + "=" * 72)
-print("[ 시나리오 A: RadixAttention 유리 — 공유 prefix, 비정렬 ]")
+print(f"[ 시나리오 A: RadixAttention 유리 — 공유 prefix, 비정렬 (block_size={BLOCK_SIZE}) ]")
 print("=" * 72)
 print(f"  system prompt: {len(sys_ids)}토큰")
 print(f"  공유 prefix:   {shared_prefix_len}토큰  (system + 'Question: What is')")
-print(f"  block_size:    {A_BLOCK_SIZE}")
+print(f"  block_size:    {BLOCK_SIZE}")
 print(f"  RadixAttention → {shared_prefix_len}토큰 전체 재사용 가능")
-print(f"  PagedAttention → {(shared_prefix_len // A_BLOCK_SIZE) * A_BLOCK_SIZE}토큰만 재사용 "
-      f"({shared_prefix_len // A_BLOCK_SIZE} full blocks, "
-      f"나머지 {shared_prefix_len % A_BLOCK_SIZE}토큰은 partial block 낭비)")
+print(f"  PagedAttention → {(shared_prefix_len // BLOCK_SIZE) * BLOCK_SIZE}토큰만 재사용 "
+      f"({shared_prefix_len // BLOCK_SIZE} full blocks, "
+      f"나머지 {shared_prefix_len % BLOCK_SIZE}토큰은 partial block 낭비)")
 
 radix_a = RadixTree()
-paged_a = PagedAttentionCache(block_size=A_BLOCK_SIZE)
+paged_a = PagedAttentionCache(block_size=BLOCK_SIZE)
 a_results = []
 
 for query, full_ids in zip(A_REQUESTS, a_full_ids):
@@ -390,7 +428,7 @@ print(f"\n  [ Radix Tree ]")
 radix_a.print_tree(tokenizer)
 
 # Block Table
-print(f"\n  [ Block Table (block_size={A_BLOCK_SIZE}) ]")
+print(f"\n  [ Block Table (block_size={BLOCK_SIZE}) ]")
 for query, full_ids in zip(A_REQUESTS, a_full_ids):
     print(f"  >> {repr(query[:40])}")
     paged_a.print_blocks(full_ids, tokenizer)
@@ -405,71 +443,156 @@ for query, full_ids in zip(A_REQUESTS, a_full_ids):
 b_ids = [tokenizer.encode(q) for q in B_REQUESTS]
 
 print("=" * 72)
-print("[ 시나리오 B: PagedAttention 유리 — Wide & Shallow Tree, Budget 제한 ]")
+print(f"[ 시나리오 B: PagedAttention 유리 — Wide & Shallow Tree, Budget 제한 (block_size={BLOCK_SIZE}) ]")
 print("=" * 72)
 print(f"  공유 prefix 없음 → Radix Tree가 루트에서 바로 분기 (wide & shallow)")
-print(f"  block_size={B_BLOCK_SIZE}  /  budget={B_BUDGET_BLOCKS} blocks = {B_BUDGET_TOKENS}토큰\n")
+print(f"  block_size={BLOCK_SIZE}  /  budget={B_BUDGET_BLOCKS} blocks = {B_BUDGET_TOKENS}토큰\n")
 
 for i, (q, ids) in enumerate(zip(B_REQUESTS, b_ids)):
-    n_full = len(ids) // B_BLOCK_SIZE
-    n_part = len(ids) % B_BLOCK_SIZE
-    print(f"  req {i+1}: {len(ids):>2}토큰  ({n_full} full block + {n_part} partial)  {repr(q[:48])}")
+    n_full = len(ids) // BLOCK_SIZE
+    n_part = len(ids) % BLOCK_SIZE
+    print(f"  req {i+1}: {len(ids):>2}토큰  ({n_full} full block + {n_part} partial)  '{q}'")
 
-seq_tok = len(b_ids[0])
+tok1, tok2 = len(b_ids[0]), len(b_ids[1])
 print(f"\n  budget {B_BUDGET_TOKENS}토큰 기준:")
-print(f"    RadixAttention → 시퀀스 전체({seq_tok}tok) 단위 eviction → {B_BUDGET_TOKENS // seq_tok}개 시퀀스 보존")
-print(f"    PagedAttention → block({B_BLOCK_SIZE}tok) 단위 eviction → {B_BUDGET_BLOCKS}개 시퀀스의 첫 block 보존")
+print(f"    RadixAttention → 노드(시퀀스 전체) 단위 eviction")
+print(f"                     req1({tok1}tok) + req2({tok2}tok) = {tok1+tok2}tok > {B_BUDGET_TOKENS}  → 동시 보존 불가, 1개만 유지")
+print(f"    PagedAttention → block({BLOCK_SIZE}tok) 단위 eviction")
+print(f"                     req1(1 block) + req2(1 block) = 2 blocks ≤ {B_BUDGET_BLOCKS}  → 둘 다 보존 가능")
 
 radix_b = RadixTreeLRU(max_tokens=B_BUDGET_TOKENS)
-paged_b = PagedAttentionCacheLRU(block_size=B_BLOCK_SIZE, max_blocks=B_BUDGET_BLOCKS)
+paged_b = PagedAttentionCacheLRU(block_size=BLOCK_SIZE, max_blocks=B_BUDGET_BLOCKS)
 
-# 1차: cold start
-print(f"\n  [ 1차 요청 — cold start ]")
-print(f"  {'req':>4}  {'R cached_tokens':>16}  {'P cached_blocks':>16}  Radix Tree 상태")
-print(f"  {'----':>4}  {'----------------':>16}  {'----------------':>16}  ---------------")
+def r_cache_state(tree: RadixTreeLRU) -> str:
+    leaves = tree._kv_leaves()
+    if not leaves:
+        return "(empty)"
+    parts = [f"'{tokenizer.decode(n.token_ids[:4])}...'({len(n.token_ids)}tok)"
+             for n, _, _ in leaves]
+    return f"{tree._cached_tokens}tok  [{', '.join(parts)}]"
+
+def p_cache_state(cache: PagedAttentionCacheLRU) -> str:
+    if not cache.block_table:
+        return "(empty)"
+    parts = [f"'{tokenizer.decode(b.token_ids[:4])}...'[{BLOCK_SIZE}tok]"
+             for b in sorted(cache.block_table.values(), key=lambda b: b.last_access)]
+    return f"{len(cache.block_table)} blocks  [{', '.join(parts)}]"
+
+# ── 1차: cold-start (모두 MISS → compute → insert) ────────────
+print(f"\n  [ 1차 요청 — cold start: MISS → compute → cache에 insert ]")
+print(f"  (캐시가 비어있으므로 모든 요청이 MISS. 하지만 compute 후 cache에 저장됨)\n")
 
 for i, (query, full_ids) in enumerate(zip(B_REQUESTS, b_ids)):
+    n_tok = len(full_ids)
+    n_blocks = n_tok // BLOCK_SIZE
+    print(f"  ▶ req {i+1} (MISS): '{query[:48]}' ({n_tok}tok)")
+
+    # RadixAttention
+    r_before = radix_b._cached_tokens
     kv = run_prefill(model, full_ids)
     run_decode(model, kv, N_ANSWER_TOKENS)
-    radix_b.match_prefix(full_ids)
     radix_b.insert(full_ids, kv)
+    r_evictions = radix_b.pop_evictions()
 
+    if r_before + n_tok > B_BUDGET_TOKENS:
+        print(f"    RadixAttention:  budget 초과 ({r_before}+{n_tok}={r_before+n_tok} > {B_BUDGET_TOKENS})")
+        for ev in r_evictions:
+            label = tokenizer.decode(ev[:5])
+            print(f"                     EVICT '{label}...' ({len(ev)}tok)  ← LRU 노드 통째로 제거")
+    else:
+        print(f"    RadixAttention:  budget 여유 ({r_before}+{n_tok}={r_before+n_tok} ≤ {B_BUDGET_TOKENS})")
+    print(f"                     → insert req{i+1} 완료  |  cache: {r_cache_state(radix_b)}")
+
+    # PagedAttention
+    p_before = len(paged_b.block_table)
     kv_p = run_prefill(model, full_ids)
     run_decode(model, kv_p, N_ANSWER_TOKENS)
-    paged_b.match_prefix(full_ids)
     paged_b.insert(full_ids, kv_p)
+    p_evictions = paged_b.pop_evictions()
 
-    leaves = radix_b._kv_leaves()
-    leaf_info = f"leaf {len(leaves)}개 ({[len(n.token_ids) for n,_,_ in leaves]}tok)"
-    print(f"  {i+1:>4}  {radix_b._cached_tokens:>16}  {len(paged_b.block_table):>16}  {leaf_info}")
+    partial = n_tok % BLOCK_SIZE
+    if p_before + n_blocks > B_BUDGET_BLOCKS:
+        print(f"    PagedAttention:  budget 초과 ({p_before}+{n_blocks}={p_before+n_blocks} > {B_BUDGET_BLOCKS})")
+        for ev in p_evictions:
+            label = tokenizer.decode(ev[:4])
+            print(f"                     EVICT '{label}...'[{BLOCK_SIZE}tok] block  ← LRU block 제거")
+    else:
+        print(f"    PagedAttention:  budget 여유 ({p_before}+{n_blocks}={p_before+n_blocks} ≤ {B_BUDGET_BLOCKS})")
+    if partial > 0:
+        print(f"                     partial {partial}tok → 캐시 불가 (block 미달, 버림)")
+    print(f"                     → insert req{i+1} block 완료  |  blocks: {p_cache_state(paged_b)}")
+    print()
 
-print(f"\n  Radix Tree (1차 후):")
-radix_b.print_tree(tokenizer)
-print(f"  → width={len(radix_b.root.children)}  depth=1  (공유 prefix 없음)")
+# 최종 cache 상태 요약
+print(f"  ── 1차 완료 후 최종 cache 상태 ──")
+print(f"  RadixAttention: {r_cache_state(radix_b)}")
+print(f"  PagedAttention: {p_cache_state(paged_b)}")
+print(f"")
+print(f"  RadixAttention: req1({tok1}tok)+req2({tok2}tok)={tok1+tok2}tok > budget({B_BUDGET_TOKENS}tok)")
+print(f"                  → req2 삽입 시 req1 evict → req2만 생존")
+print(f"  PagedAttention: req1(1 block)+req2(1 block)=2 blocks = budget({B_BUDGET_BLOCKS} blocks)")
+print(f"                  → req1·req2 block 둘 다 생존")
+print(f"")
+print(f"  ※ 1차 요청은 모두 MISS였지만 compute 후 cache에 삽입됨")
+print(f"     eviction 정책 차이로 살아남은 데이터가 다름 → 2차 HIT 수 차이")
 
-# 2차: replay
-print(f"\n  [ 2차 요청 — 동일 요청 replay ]")
-print(f"  {'req':>4}  {'RadixAttention':>20}  {'PagedAttention':>20}")
-print(f"  {'----':>4}  {'--------------------':>20}  {'--------------------':>20}")
+# ── 2차: 동일 요청 재실행 (현실적: MISS도 compute+insert) ──────
+print(f"\n  [ 2차 요청 — 동일한 req1·req2 재도착 ]")
+print(f"  (MISS 시에도 compute + insert 수행 — 실제 서빙과 동일)\n")
 
-r_hits, r_saved, p_hits, p_saved = 0, 0, 0, 0
+r_hits = p_hits = r_saved = p_saved = 0
+
 for i, (query, full_ids) in enumerate(zip(B_REQUESTS, b_ids)):
-    r_match, _ = radix_b.match_prefix(full_ids)
-    p_match, _ = paged_b.match_prefix(full_ids)
-    if r_match > 0: r_hits += 1; r_saved += r_match
-    if p_match > 0: p_hits += 1; p_saved += p_match
-    r_s = f"HIT {r_match}tok" if r_match else "MISS"
-    p_s = f"HIT {p_match}tok" if p_match else "MISS"
-    print(f"  {i+1:>4}  {r_s:>20}  {p_s:>20}")
+    n_tok    = len(full_ids)
+    n_blocks = n_tok // BLOCK_SIZE
+    print(f"  ▶ req{i+1} (2차): '{query}' ({n_tok}tok)")
 
-print(f"\n  {'':4}  {'RadixAttention':>20}  {'PagedAttention':>20}")
-print(f"  {'HIT 요청수':4}  {r_hits:>20}  {p_hits:>20}  ← PagedAttention이 더 많은 요청 서빙")
-print(f"  {'절감 토큰합':4}  {r_saved:>20}  {p_saved:>20}")
-print(f"""
-  이유: RadixAttention은 시퀀스 전체({seq_tok}tok)를 하나의 노드로 보존
-        → budget({B_BUDGET_TOKENS}tok) / {seq_tok}tok = {B_BUDGET_TOKENS // seq_tok}개 시퀀스만 유지 가능
-        PagedAttention은 {B_BLOCK_SIZE}tok block 단위로 세밀하게 보존
-        → budget({B_BUDGET_BLOCKS} blocks)에 {B_BUDGET_BLOCKS}개 시퀀스의 첫 block 유지 가능""")
+    # ── RadixAttention ──
+    r_before       = radix_b._cached_tokens
+    r_match, r_kv  = radix_b.match_prefix(full_ids)
+
+    if r_match > 0:
+        r_hits += 1; r_saved += r_match
+        remaining = full_ids[r_match:]
+        kv_r = run_prefill(model, remaining, past_kv=r_kv) if remaining else r_kv
+        print(f"    RadixAttention: HIT {r_match}tok  → {len(remaining)}tok만 compute → insert")
+    else:
+        print(f"    RadixAttention: MISS → {n_tok}tok 전체 compute → insert")
+        kv_r = run_prefill(model, full_ids)
+        if r_before + n_tok > B_BUDGET_TOKENS:
+            print(f"                   budget 초과 ({r_before}+{n_tok}={r_before+n_tok} > {B_BUDGET_TOKENS})")
+    radix_b.insert(full_ids, kv_r)
+    for ev in radix_b.pop_evictions():
+        print(f"                   EVICT '{tokenizer.decode(ev[:5])}...' ({len(ev)}tok)")
+    run_decode(model, kv_r, N_ANSWER_TOKENS)
+    print(f"                   cache: {r_cache_state(radix_b)}")
+
+    # ── PagedAttention ──
+    p_before       = len(paged_b.block_table)
+    p_match, p_kv  = paged_b.match_prefix(full_ids)
+
+    if p_match > 0:
+        p_hits += 1; p_saved += p_match
+        remaining = full_ids[p_match:]
+        kv_p = run_prefill(model, remaining, past_kv=p_kv) if remaining else p_kv
+        print(f"    PagedAttention: HIT {p_match}tok  → {len(remaining)}tok만 compute → insert (new blocks only)")
+    else:
+        print(f"    PagedAttention: MISS → {n_tok}tok 전체 compute → insert")
+        kv_p = run_prefill(model, full_ids)
+        if p_before + n_blocks > B_BUDGET_BLOCKS:
+            print(f"                   budget 초과 ({p_before}+{n_blocks}={p_before+n_blocks} > {B_BUDGET_BLOCKS})")
+    paged_b.insert(full_ids, kv_p)
+    for ev in paged_b.pop_evictions():
+        print(f"                   EVICT '{tokenizer.decode(ev[:4])}...'[{BLOCK_SIZE}tok] block")
+    if n_tok % BLOCK_SIZE:
+        print(f"                   partial {n_tok % BLOCK_SIZE}tok → 버림")
+    run_decode(model, kv_p, N_ANSWER_TOKENS)
+    print(f"                   blocks: {p_cache_state(paged_b)}")
+    print()
+
+print(f"  {'':6}  {'RadixAttention':>18}  {'PagedAttention':>18}")
+print(f"  {'HIT 수':6}  {r_hits:>18}  {p_hits:>18}  ← PagedAttention이 더 많은 요청 서빙")
+print(f"  {'절감 tok':6}  {r_saved:>18}  {p_saved:>18}")
 
 
 # ════════════════════════════════════════════════════════════════

@@ -1,0 +1,136 @@
+모델 로딩: gpt2 ...
+
+========================================================================
+[ 시나리오 A: RadixAttention 유리 — 공유 prefix, 비정렬 (block_size=8) ]
+========================================================================
+  system prompt: 18토큰
+  공유 prefix:   22토큰  (system + 'Question: What is')
+  block_size:    8
+  RadixAttention → 22토큰 전체 재사용 가능
+  PagedAttention → 16토큰만 재사용 (2 full blocks, 나머지 6토큰은 partial block 낭비)
+
+  req  query                                     RadixAttention    PagedAttention
+  ---  -----                                   ----------------  ----------------
+    1  'Question: What is machine learning?'        MISS (0tok)       MISS (0tok)
+    2  'Question: What is deep learning?'      PART HIT (22tok)  PART HIT (16tok)
+    3  'Question: What is neural network?'     PART HIT (22tok)  PART HIT (16tok)
+    4  'Completely different topic: Tell me '  PART HIT (18tok)  PART HIT (16tok)
+
+                                            RadixAttention    PagedAttention
+  총 계산 토큰                                               42                56
+  token 절감률                                           60%              46%
+
+  [ Radix Tree ]
+  root
+  ├─ 'You are a helpful AI assistant. Answer questions clearly and concisely. Always be polite.' (18tok)  cumlen=18
+  │  ├─ 'Question: What is' (4tok)  cumlen=22
+  │  │  ├─ ' machine learning?' (3tok) [KV]  cumlen=25
+  │  │  ├─ ' deep learning?' (3tok) [KV]  cumlen=25
+  │  │  ├─ ' neural network?' (3tok) [KV]  cumlen=25
+  │  ├─ 'Completely different topic: Tell me about the weather.' (11tok) [KV]  cumlen=29
+
+  [ Block Table (block_size=8) ]
+  >> 'Question: What is machine learning?'
+  Block [ 0~ 7] 'You are a helpful AI assistant. Answer' [KV]
+  Block [ 8~15] ' questions clearly and concisely. Always be' [KV]
+  Block [16~23] ' polite.Question: What is machine learning' [KV]
+  Block [24~24] '?'  [partial — 캐시 불가]
+
+  >> 'Question: What is deep learning?'
+  Block [ 0~ 7] 'You are a helpful AI assistant. Answer' [KV]
+  Block [ 8~15] ' questions clearly and concisely. Always be' [KV]
+  Block [16~23] ' polite.Question: What is deep learning' [KV]
+  Block [24~24] '?'  [partial — 캐시 불가]
+
+  >> 'Question: What is neural network?'
+  Block [ 0~ 7] 'You are a helpful AI assistant. Answer' [KV]
+  Block [ 8~15] ' questions clearly and concisely. Always be' [KV]
+  Block [16~23] ' polite.Question: What is neural network' [KV]
+  Block [24~24] '?'  [partial — 캐시 불가]
+
+  >> 'Completely different topic: Tell me abou'
+  Block [ 0~ 7] 'You are a helpful AI assistant. Answer' [KV]
+  Block [ 8~15] ' questions clearly and concisely. Always be' [KV]
+  Block [16~23] ' polite.Completely different topic: Tell' [KV]
+  Block [24~28] ' me about the weather.'  [partial — 캐시 불가]
+
+========================================================================
+[ 시나리오 B: PagedAttention 유리 — Wide & Shallow Tree, Budget 제한 (block_size=8) ]
+========================================================================
+  공유 prefix 없음 → Radix Tree가 루트에서 바로 분기 (wide & shallow)
+  block_size=8  /  budget=2 blocks = 16토큰
+
+  req 1:  8토큰  (1 full block + 0 partial)  'Machine learning algorithms learn patterns from labeled datasets'
+  req 2:  9토큰  (1 full block + 1 partial)  'Environmental scientists study the effects of climate on life'
+
+  budget 16토큰 기준:
+    RadixAttention → 노드(시퀀스 전체) 단위 eviction
+                     req1(8tok) + req2(9tok) = 17tok > 16  → 동시 보존 불가, 1개만 유지
+    PagedAttention → block(8tok) 단위 eviction
+                     req1(1 block) + req2(1 block) = 2 blocks ≤ 2  → 둘 다 보존 가능
+
+  [ 1차 요청 — cold start: MISS → compute → cache에 insert ]
+  (캐시가 비어있으므로 모든 요청이 MISS. 하지만 compute 후 cache에 저장됨)
+
+  ▶ req 1 (MISS): 'Machine learning algorithms learn patterns from ' (8tok)
+    RadixAttention:  budget 여유 (0+8=8 ≤ 16)
+                     → insert req1 완료  |  cache: 8tok  ['Machine learning algorithms learn...'(8tok)]
+    PagedAttention:  budget 여유 (0+1=1 ≤ 2)
+                     → insert req1 block 완료  |  blocks: 1 blocks  ['Machine learning algorithms learn...'[8tok]]
+
+  ▶ req 2 (MISS): 'Environmental scientists study the effects of cl' (9tok)
+    RadixAttention:  budget 초과 (8+9=17 > 16)
+                     EVICT 'Machine learning algorithms learn patterns...' (8tok)  ← LRU 노드 통째로 제거
+                     → insert req2 완료  |  cache: 9tok  ['Environmental scientists study the...'(9tok)]
+    PagedAttention:  budget 여유 (1+1=2 ≤ 2)
+                     partial 1tok → 캐시 불가 (block 미달, 버림)
+                     → insert req2 block 완료  |  blocks: 2 blocks  ['Machine learning algorithms learn...'[8tok], 'Environmental scientists study the...'[8tok]]
+
+  ── 1차 완료 후 최종 cache 상태 ──
+  RadixAttention: 9tok  ['Environmental scientists study the...'(9tok)]
+  PagedAttention: 2 blocks  ['Machine learning algorithms learn...'[8tok], 'Environmental scientists study the...'[8tok]]
+
+  RadixAttention: req1(8tok)+req2(9tok)=17tok > budget(16tok)
+                  → req2 삽입 시 req1 evict → req2만 생존
+  PagedAttention: req1(1 block)+req2(1 block)=2 blocks = budget(2 blocks)
+                  → req1·req2 block 둘 다 생존
+
+  ※ 1차 요청은 모두 MISS였지만 compute 후 cache에 삽입됨
+     eviction 정책 차이로 살아남은 데이터가 다름 → 2차 HIT 수 차이
+
+  [ 2차 요청 — 동일한 req1·req2 재도착 ]
+  (MISS 시에도 compute + insert 수행 — 실제 서빙과 동일)
+
+  ▶ req1 (2차): 'Machine learning algorithms learn patterns from labeled datasets' (8tok)
+    RadixAttention: MISS → 8tok 전체 compute → insert
+                   budget 초과 (9+8=17 > 16)
+                   EVICT 'Environmental scientists study the effects...' (9tok)
+                   cache: 8tok  ['Machine learning algorithms learn...'(8tok)]
+    PagedAttention: HIT 8tok  → 0tok만 compute → insert (new blocks only)
+                   blocks: 2 blocks  ['Environmental scientists study the...'[8tok], 'Machine learning algorithms learn...'[8tok]]
+
+  ▶ req2 (2차): 'Environmental scientists study the effects of climate on life' (9tok)
+    RadixAttention: MISS → 9tok 전체 compute → insert
+                   budget 초과 (8+9=17 > 16)
+                   EVICT 'Machine learning algorithms learn patterns...' (8tok)
+                   cache: 9tok  ['Environmental scientists study the...'(9tok)]
+    PagedAttention: HIT 8tok  → 1tok만 compute → insert (new blocks only)
+                   partial 1tok → 버림
+                   blocks: 2 blocks  ['Machine learning algorithms learn...'[8tok], 'Environmental scientists study the...'[8tok]]
+
+              RadixAttention      PagedAttention
+  HIT 수                    0                   2  ← PagedAttention이 더 많은 요청 서빙
+  절감 tok                   0                  16
+
+========================================================================
+[ 최종 비교: 언제 어느 쪽이 유리한가 ]
+========================================================================
+
+  조건                                    RadixAttention     PagedAttention
+  ─────────────────────────────────────   ──────────────     ──────────────
+  공유 prefix 많음, 비정렬 (시나리오 A)   ✅ 유리             ❌ partial 낭비
+  Wide & Shallow + budget 빡빡 (시나리오B) ❌ 굵은 eviction   ✅ 세밀한 eviction
+  GPU 메모리 단편화 방지                   ❌ 가변 노드 크기   ✅ 고정 block 크기
+  긴 system prompt / RAG context           ✅ 크게 유리        △ block 정렬 필요
+  구현 복잡도                              ❌ 높음 (트리)      ✅ 낮음 (해시)
+
